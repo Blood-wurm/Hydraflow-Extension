@@ -93,6 +93,74 @@ def _convert_value(val):
 # SECTION 2: DOT TABULATION PDF PARSER
 # =============================================================================
 
+_HEADER_FRAGMENTS = {"Line", "HGL", "EGL", "Up", "Dn"}
+
+def _find_dot_header_cols(row):
+    """Return (hgl_up_col, hgl_dn_col) from a header row, or (None, None)."""
+    cells = [c.strip() if c else '' for c in row]
+    matches = sum(1 for c in cells if any(f in c for f in _HEADER_FRAGMENTS))
+    if matches < 3:
+        return None, None
+    # Find the first column whose header contains 'HGL' and whose next column
+    # header contains 'Up', with the column after that containing 'Dn'.
+    for j, c in enumerate(cells):
+        if 'HGL' in c:
+            # Look for adjacent Up/Dn pair
+            for k in range(j, min(j + 4, len(cells) - 1)):
+                if 'Up' in cells[k] and k + 1 < len(cells) and 'Dn' in cells[k + 1]:
+                    return k, k + 1
+    return None, None
+
+def _parse_dot_rows_table(table):
+    """Extract {line_no: {'HGL Up': float, 'HGL Dn': float}} from a pdfplumber table."""
+    result = {}
+    hgl_up_col = hgl_dn_col = None
+    for row in table:
+        if not row:
+            continue
+        # Try to identify header row
+        if hgl_up_col is None:
+            u, d = _find_dot_header_cols(row)
+            if u is not None:
+                hgl_up_col, hgl_dn_col = u, d
+            continue
+        # Data row: col 0 must be a positive integer line number
+        raw_ln = row[0].strip() if row[0] else ''
+        try:
+            line_no = int(raw_ln)
+            if line_no <= 0:
+                continue
+        except (ValueError, AttributeError):
+            continue
+        try:
+            hgl_up = float(row[hgl_up_col]) if row[hgl_up_col] else None
+            hgl_dn = float(row[hgl_dn_col]) if row[hgl_dn_col] else None
+        except (ValueError, TypeError, IndexError):
+            continue
+        if hgl_up is None or hgl_dn is None:
+            continue
+        result[line_no] = {'HGL Up': hgl_up, 'HGL Dn': hgl_dn}
+    return result
+
+def _parse_dot_rows_regex(text):
+    """Fallback: extract {line_no: {'HGL Up': float, 'HGL Dn': float}} via regex."""
+    result = {}
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        dot_match = re.match(
+            r'^(\d+)\s+\S+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
+            r'[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
+            r'[\d.]+\s+[\d.]+\s+\d+\s+[\d.]+\s+'
+            r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+'
+            r'[\d.]+\s+[\d.]+\s+(.+)$', line)
+        if dot_match:
+            line_no = int(dot_match.group(1))
+            result[line_no] = {
+                'HGL Up': float(dot_match.group(4)),
+                'HGL Dn': float(dot_match.group(5)),
+            }
+    return result
+
 def parse_dot_pdf(filepath):
     """Parse DOT tabulation PDF. Returns LIST of dicts, one per return period found.
     Each dict has: project_file, return_period, return_period_num, data, dot_pages."""
@@ -132,21 +200,19 @@ def parse_dot_pdf(filepath):
 
             current['dot_pages'].append(page_idx)
 
-            # Parse data rows
-            for raw_line in text.split('\n'):
-                line = raw_line.strip()
-                dot_match = re.match(
-                    r'^(\d+)\s+\S+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
-                    r'[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
-                    r'[\d.]+\s+[\d.]+\s+\d+\s+[\d.]+\s+'
-                    r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+'
-                    r'[\d.]+\s+[\d.]+\s+(.+)$', line)
-                if dot_match:
-                    line_no = int(dot_match.group(1))
-                    current['data'][line_no] = {
-                        'HGL Up': float(dot_match.group(4)),
-                        'HGL Dn': float(dot_match.group(5)),
-                    }
+            # Parse data rows via extract_tables(); fall back to regex if needed
+            table_settings = {
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+            }
+            tables = page.extract_tables(table_settings)
+            if tables:
+                for table in tables:
+                    parsed = _parse_dot_rows_table(table)
+                    current['data'].update(parsed)
+            else:
+                parsed = _parse_dot_rows_regex(text)
+                current['data'].update(parsed)
 
     # Set project file on all entries
     for r in results:
@@ -281,13 +347,25 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     gr, ge = [], []
     for r, g in zip(R, G):
         if g > 0: gr.append(r); ge.append(g)
-    if gr: ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
+    if gr:
+        ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
+        ax.fill_between(gr, ge, emax, color=COLOR_GROUND, alpha=0.08, zorder=1)
     # Pipes
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
         ax.plot([x_start, x_end], [I[i], I[i+1]], color=COLOR_INVERT, linewidth=LW_INV, zorder=4)
         ax.plot([x_start, x_end], [C[i], C[i+1]], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
+        ax.fill_between(
+            [x_start, x_end],
+            [I[i], I[i+1]],
+            [C[i], C[i+1]],
+            facecolor='none',
+            edgecolor=COLOR_INVERT,
+            alpha=0.3,
+            hatch='///',
+            zorder=3,
+        )
     # HGL
     if any(s['hgl_dn'] is not None for s in S):
         for i, s in enumerate(S):
@@ -306,7 +384,11 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         if grd <= 0 or r in drawn: continue
         drawn.add(r)
         bl = 0 if r == 0 else r - hw
-        ax.add_patch(patches.Rectangle((bl, inv), sw, grd - inv, lw=1.2, ec=COLOR_STRUCTURE, fc='none', zorder=7))
+        ax.add_patch(patches.Rectangle(
+            (bl, inv), sw, grd - inv,
+            lw=1.2, ec=COLOR_STRUCTURE, fc='none',
+            hatch='///', alpha=0.4, zorder=7,
+        ))
         sq = (emax - emin) * 0.012
         ax.add_patch(patches.Rectangle((bl + hw*0.2, inv), sw*0.6, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8))
     # Error annotation
