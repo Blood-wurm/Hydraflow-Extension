@@ -6,8 +6,9 @@ storm sewer deliverable packages as PDF output.
 Deliverable structure per system:
   1. Plan view (generated from .stm)
   2. For each return period (sorted):
-     a. DOT tabulation page(s) (inserted from Hydraflow PDF)
-     b. Profile plots for each line designation
+     a. Other report page(s) if included (inserted from Hydraflow PDF)
+     b. DOT tabulation page(s) (inserted from Hydraflow PDF)
+     c. Profile plots for each line designation
 """
 
 import re
@@ -340,6 +341,53 @@ def parse_dot_pdf(filepath):
 
     return results
 
+def parse_other_report_pdf(filepath):
+    """Parse a non-DOT report PDF for project file and return period.
+    Uses the same footer patterns as parse_dot_pdf (Project File / Return period).
+    Returns a LIST of dicts, one per return period found.
+    Each dict has: project_file, return_period, return_period_num, pages."""
+    results = []
+    current = None
+    project_file = None
+
+    with pdfplumber.open(filepath) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            # Look for return period and project file using same patterns as DOT
+            page_rp = None
+            for raw_line in text.split('\n'):
+                rp = re.search(r'Return period\s*=\s*(\d+)\s*Yrs', raw_line)
+                if rp:
+                    page_rp = int(rp.group(1))
+                pf = re.search(r'Project File:\s*(.*?\.stm)', raw_line)
+                if pf and not project_file:
+                    project_file = os.path.splitext(pf.group(1).strip())[0]
+
+            # Start new entry if return period changed
+            if page_rp and (current is None or current['return_period_num'] != page_rp):
+                current = {
+                    'project_file': project_file,
+                    'return_period': f"{page_rp} YEAR",
+                    'return_period_num': page_rp,
+                    'pages': [],
+                }
+                results.append(current)
+
+            if current is None:
+                continue
+
+            current['pages'].append(page_idx)
+
+    # Set project file on all entries
+    for r in results:
+        if not r['project_file']:
+            r['project_file'] = project_file
+
+    return results
+
 def parse_report_pdf(filepath):
     """Parse custom report PDF (legacy). Returns dict keyed by Line No."""
     results = {}
@@ -641,7 +689,7 @@ def plot_plan_view(lines, project_name=''):
         ax.set_xlim(xmn - xp, xmx + xp)
         ax.set_ylim(ymn - yp - extra, ymx + yp + extra)
     ax.tick_params(labelbottom=False, labelleft=False, bottom=False, left=False)
-    ax.set_title(f'Hydraflow Plan View\n{project_name}', fontsize=14, fontweight='bold', loc='left', pad=10)
+    ax.set_title(f'Plan View\n{project_name}', fontsize=14, fontweight='bold', loc='left', pad=10)
     for sp in ax.spines.values(): sp.set_linewidth(1.5)
     fig.subplots_adjust(left=_l, right=_r, top=_t, bottom=_b)
     return fig
@@ -652,20 +700,29 @@ def plot_plan_view(lines, project_name=''):
 # =============================================================================
 
 def classify_files(file_paths):
-    stm_files = {}; dot_files = []
+    stm_files = {}; dot_files = []; other_files = []
     for fp in file_paths:
         ext = os.path.splitext(fp)[1].lower()
         if ext == '.stm':
             stm_files[os.path.splitext(os.path.basename(fp))[0]] = fp
         elif ext == '.pdf':
             entries = parse_dot_pdf(fp)
+            is_dot = False
             for info in entries:
                 if info['data'] and info['project_file'] and info['return_period']:
                     dot_files.append({**info, 'path': fp})
                     print(f"  DOT: {os.path.basename(fp)} -> {info['project_file']} / {info['return_period']} ({len(info['data'])} lines)")
-            if not entries:
-                print(f"  Skipped: {os.path.basename(fp)} (no DOT tabulations found)")
-    return stm_files, dot_files
+                    is_dot = True
+            if not is_dot:
+                # Try as other report (non-DOT)
+                other_entries = parse_other_report_pdf(fp)
+                for info in other_entries:
+                    if info['project_file'] and info['return_period']:
+                        other_files.append({**info, 'path': fp})
+                        print(f"  Report: {os.path.basename(fp)} -> {info['project_file']} / {info['return_period']} ({len(info['pages'])} pages)")
+                if not other_entries:
+                    print(f"  Skipped: {os.path.basename(fp)} (no DOT tabulations or report data found)")
+    return stm_files, dot_files, other_files
 
 def _fig_to_temp_pdf(fig, prefix='temp'):
     fd, path = tempfile.mkstemp(suffix='.pdf', prefix=f'ssp_{prefix}_')
@@ -680,11 +737,17 @@ def _append_pdf(writer, path, page_nums=None):
     else:
         for pn in page_nums: writer.add_page(reader.pages[pn])
 
-def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf'):
+def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf', other_files=None):
     writer = PdfWriter()
     dot_by_proj = defaultdict(list)
     for d in dot_files: dot_by_proj[d['project_file']].append(d)
     for pf in dot_by_proj: dot_by_proj[pf].sort(key=lambda x: x['return_period_num'])
+    # Group other reports by (project_file, return_period_num)
+    other_by_proj_rp = defaultdict(list)
+    if other_files:
+        for o in other_files:
+            key = (o['project_file'], o['return_period_num'])
+            other_by_proj_rp[key].append(o)
     systems = []
     for sn, sp in sorted(stm_files.items()):
         systems.append((sn, sp, dot_by_proj.get(sn, [])))
@@ -705,6 +768,13 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf'):
         if dots:
             for di in dots:
                 rl = di['return_period']; rd = di['data']; dp = di['path']
+                rp_num = di['return_period_num']
+                # Other report pages (before DOT)
+                for oi in other_by_proj_rp.get((sn, rp_num), []):
+                    reader = PdfReader(oi['path'])
+                    for pg_idx in oi['pages']:
+                        writer.add_page(reader.pages[pg_idx]); pc += 1
+                        print(f"  Page {pc}: Report - {os.path.basename(oi['path'])} - {rl}")
                 # DOT pages
                 for dpi in di.get('dot_pages', []):
                     _append_pdf(writer, dp, [dpi]); pc += 1
@@ -727,6 +797,59 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf'):
                 tp = _fig_to_temp_pdf(fig, f'p_{pfx}'); plt.close(fig)
                 _append_pdf(writer, tp); os.unlink(tp); pc += 1
                 print(f"  Page {pc}: {pfx} (geometry only)")
+    with open(output_path, 'wb') as f: writer.write(f)
+    print(f"\nDone! {pc} pages written to {output_path}")
+
+def compile_reports(dot_files, output_path='reports.pdf', other_files=None):
+    """Compile report PDFs only (no STM/profiles required).
+    Page order per project file / return period: other reports -> DOT pages."""
+    writer = PdfWriter()
+    # Group DOT files by project, sorted by return period
+    dot_by_proj = defaultdict(list)
+    for d in dot_files:
+        dot_by_proj[d['project_file']].append(d)
+    for pf in dot_by_proj:
+        dot_by_proj[pf].sort(key=lambda x: x['return_period_num'])
+    # Group other reports by (project_file, return_period_num)
+    other_by_proj_rp = defaultdict(list)
+    if other_files:
+        for o in other_files:
+            key = (o['project_file'], o['return_period_num'])
+            other_by_proj_rp[key].append(o)
+    # Collect all project files from both DOT and other reports
+    all_projects = sorted(set(
+        list(dot_by_proj.keys()) +
+        [k[0] for k in other_by_proj_rp.keys()]
+    ))
+    if not all_projects:
+        print("ERROR: No reports to compile."); return
+    # Collect all return periods per project (from both sources)
+    rp_by_proj = defaultdict(set)
+    for pf in dot_by_proj:
+        for d in dot_by_proj[pf]:
+            rp_by_proj[pf].add(d['return_period_num'])
+    for (pf, rp_num) in other_by_proj_rp:
+        rp_by_proj[pf].add(rp_num)
+    pc = 0
+    for proj in all_projects:
+        print(f"\n{'='*60}\nProject: {proj}\n{'='*60}")
+        for rp_num in sorted(rp_by_proj[proj]):
+            rl = f"{rp_num} YEAR"
+            # Other report pages
+            for oi in other_by_proj_rp.get((proj, rp_num), []):
+                reader = PdfReader(oi['path'])
+                for pg_idx in oi['pages']:
+                    writer.add_page(reader.pages[pg_idx]); pc += 1
+                    print(f"  Page {pc}: Report - {os.path.basename(oi['path'])} - {rl}")
+            # DOT pages
+            for di in dot_by_proj.get(proj, []):
+                if di['return_period_num'] != rp_num:
+                    continue
+                for dpi in di.get('dot_pages', []):
+                    _append_pdf(writer, di['path'], [dpi]); pc += 1
+                    print(f"  Page {pc}: DOT - {rl}")
+    if pc == 0:
+        print("ERROR: No report pages found."); return
     with open(output_path, 'wb') as f: writer.write(f)
     print(f"\nDone! {pc} pages written to {output_path}")
 
@@ -1011,9 +1134,9 @@ def main():
     if args.gui or (args.stm is None and not args.files and not args.report):
         launch_gui(); return
     if args.files:
-        sf, df = classify_files(args.files)
+        sf, df, of = classify_files(args.files)
         if not sf: print("ERROR: No .stm files."); return
-        generate_deliverable(sf, df, args.output); return
+        generate_deliverable(sf, df, args.output, of); return
     if not args.stm: parser.error('Provide .stm or --files')
     rp = {}
     for r in args.report:
@@ -1073,8 +1196,11 @@ def launch_gui():
         if p: ov.set(p)
     tk.Button(ro,text="Browse...",font=FS,command=bo,padx=10).pack(side='left')
     bfr=tk.Frame(ct,bg=BG); bfr.pack(fill='x',pady=(8,6))
-    gb=tk.Button(bfr,text="Generate Deliverable",font=("Segoe UI",11,"bold"),bg=BBG,fg=BFG,activebackground="#1e4a80",activeforeground="white",padx=20,pady=6,cursor="hand2")
+    gb=tk.Button(bfr,text="Generate Storm-Sewer Profiles",font=("Segoe UI",11,"bold"),bg=BBG,fg=BFG,activebackground="#1e4a80",activeforeground="white",padx=20,pady=6,cursor="hand2")
     gb.pack(side='left',expand=True)
+    CRB="#2a7d4f"; CRA="#1e5d3a"
+    cb=tk.Button(bfr,text="Compile Reports",font=("Segoe UI",11,"bold"),bg=CRB,fg=BFG,activebackground=CRA,activeforeground="white",padx=20,pady=6,cursor="hand2")
+    cb.pack(side='left',expand=True,padx=(10,0))
     SCB="#8B0000"; SCA="#6B0000"
     sb=tk.Button(bfr,text="System Check",font=("Segoe UI",11,"bold"),bg=SCB,fg=BFG,activebackground=SCA,activeforeground="white",padx=20,pady=6,cursor="hand2")
     sb.pack(side='left',expand=True,padx=(10,0))
@@ -1095,15 +1221,15 @@ def launch_gui():
         def dw():
             try:
                 print("Classifying files...")
-                sf,df=classify_files(file_list)
+                sf,df,of=classify_files(file_list)
                 if not sf: root.after(0,lambda:messagebox.showerror("Error","No .stm files found.")); return
-                generate_deliverable(sf,df,op)
+                generate_deliverable(sf,df,op,of)
                 root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
             except Exception as e:
                 root.after(0,lambda:messagebox.showerror("Error",str(e)))
                 import traceback; traceback.print_exc()
             finally:
-                sys.stdout=old; root.after(0,lambda:gb.configure(state='normal',text="Generate Deliverable"))
+                sys.stdout=old; root.after(0,lambda:gb.configure(state='normal',text="Generate Storm-Sewer Profiles"))
         threading.Thread(target=dw,daemon=True).start()
     def rsc():
         pdfs=[f for f in file_list if f.lower().endswith('.pdf')]
@@ -1127,7 +1253,30 @@ def launch_gui():
             finally:
                 sys.stdout=old; root.after(0,lambda:sb.configure(state='normal',text="System Check"))
         threading.Thread(target=dw,daemon=True).start()
-    gb.configure(command=rg); sb.configure(command=rsc); root.mainloop()
+    def rcr():
+        pdfs=[f for f in file_list if f.lower().endswith('.pdf')]
+        if not pdfs: messagebox.showwarning("No PDFs","Add report PDF files."); return
+        op=ov.get().strip()
+        if not op: messagebox.showwarning("No Output","Specify output path."); return
+        for fp in pdfs:
+            if not os.path.isfile(fp): messagebox.showerror("Not Found",f"Missing:\n{fp}"); return
+        lt.configure(state='normal'); lt.delete('1.0',tk.END); lt.configure(state='disabled')
+        cb.configure(state='disabled',text="Compiling...")
+        old=sys.stdout; sys.stdout=LR(lt)
+        def dw():
+            try:
+                print("Classifying files...")
+                _,df,of=classify_files(pdfs)
+                if not df and not of: root.after(0,lambda:messagebox.showerror("Error","No report data found in PDFs.")); return
+                compile_reports(df,op,of)
+                root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
+            except Exception as e:
+                root.after(0,lambda:messagebox.showerror("Error",str(e)))
+                import traceback; traceback.print_exc()
+            finally:
+                sys.stdout=old; root.after(0,lambda:cb.configure(state='normal',text="Compile Reports"))
+        threading.Thread(target=dw,daemon=True).start()
+    gb.configure(command=rg); cb.configure(command=rcr); sb.configure(command=rsc); root.mainloop()
 
 
 if __name__ == '__main__':
