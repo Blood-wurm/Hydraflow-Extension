@@ -875,6 +875,28 @@ def _format_stm_block(data):
     return out
 
 
+# Fields owned by the Inlets tab (overlaid from I_data over L_data).
+# All other fields come from L_data exclusively.
+_INLETS_OWNED_FIELDS = frozenset({
+    'Inlet ID',
+    'Junction Type',
+    'Inlet Sag',
+    'Downstream Inlet No.',
+    'Inlet Length',
+    'Inlet throat height',
+    'Grate Opening Area',
+    'Grate Width',
+    'Grate Length',
+    'Known Capacity',
+    'Inlet Cross Slope Sx',
+    'Inlet Cross Slope Sw',
+    'Local Inlet Depression',
+    'Gutter Width',
+    'Gutter Slope',
+    'Gutter N-Value',
+})
+
+
 def rebuild_stm(stm_path, L_data, I_data):
     """Rebuild a .stm file using the original header/footer but with
     LINE DATA reconstructed entirely from the in-memory dicts.
@@ -928,19 +950,15 @@ def rebuild_stm(stm_path, L_data, I_data):
     line_data_section = []
 
     for line_no in all_line_nos:
-        # Merge: start with L_data (has coords, geometry), overlay I_data
+        # Start with L_data (authoritative for everything except Inlets-tab fields)
         merged = {}
         if line_no in L_data:
             merged.update(L_data[line_no])
+        # Overlay only Inlets-tab-owned fields from I_data
         if line_no in I_data:
-            # Only overlay inlet-specific keys from I_data
             for k, v in I_data[line_no].items():
-                if k in merged and k in ('X Coord Dn', 'Y Coord Dn',
-                                         'X Coord Up', 'Y Coord Up',
-                                         'Deflection Angle', 'Bearing',
-                                         'Line Length'):
-                    continue    # L_data owns geometry/coords
-                merged[k] = v
+                if k in _INLETS_OWNED_FIELDS:
+                    merged[k] = v
         merged['Line No.'] = line_no
 
         block_lines = _format_stm_block(merged)
